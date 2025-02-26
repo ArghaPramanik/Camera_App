@@ -20,6 +20,7 @@ import android.media.ImageReader
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.ByteBuffer
 
 class MainActivity : AppCompatActivity() {
 
@@ -45,20 +46,21 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        capturePhotoButton = findViewById(R.id.capturePhotoButton)
-        recordVideoButton = findViewById(R.id.recordVideoButton)
         surfaceView = findViewById(R.id.surfaceView)
-
         cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
+        photoDirectory = filesDir
 
-        photoDirectory = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "Saved Photos")
-        videoDirectory = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), "Saved Videos")
+        surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                isSurfaceCreated = true
+                openCamera()
+            }
 
-        if (!photoDirectory.exists()) photoDirectory.mkdirs()
-        if (!videoDirectory.exists()) videoDirectory.mkdirs()
-
-        setupSurfaceView()
-        setupButtons()
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                isSurfaceCreated = false
+            }
+        })
     }
 
     private fun setupButtons() {
@@ -205,6 +207,9 @@ class MainActivity : AppCompatActivity() {
 
             val surface = imageReader.surface
             captureRequestBuilder.addTarget(surface)
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
 
             cameraDevice!!.createCaptureSession(
                 listOf(surface, surfaceView.holder.surface),
@@ -273,18 +278,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun openCamera() {
         try {
-            if (!isSurfaceCreated) {
-                isPendingCameraOpen = true
-                return
-            }
-
-            cameraId = cameraManager.cameraIdList[0]
+            val cameraId = cameraManager.cameraIdList[0]
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions()
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 101)
                 return
             }
-
-            cameraManager.openCamera(cameraId!!, object : CameraDevice.StateCallback() {
+            cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     cameraDevice = camera
                     startCameraPreview()
@@ -298,52 +297,67 @@ class MainActivity : AppCompatActivity() {
                 override fun onError(camera: CameraDevice, error: Int) {
                     camera.close()
                     cameraDevice = null
-                    Log.e("CameraAppp", "Camera device error: $error")
-                    Toast.makeText(this@MainActivity, "Camera error: $error", Toast.LENGTH_SHORT).show()
                 }
             }, null)
-        } catch (e: CameraAccessException) {
-            Log.e("CameraAppp", "Error opening camera", e)
+        } catch (e: Exception) {
+            Log.e("CameraApp", "Error opening camera", e)
         }
     }
 
     private fun startCameraPreview() {
         try {
-            if (cameraDevice == null || !isSurfaceCreated) {
-                return
-            }
+            if (cameraDevice == null || !isSurfaceCreated) return
 
             val surface = surfaceView.holder.surface
             val previewRequestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             previewRequestBuilder.addTarget(surface)
 
-            cameraDevice!!.createCaptureSession(
-                listOf(surface),
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(session: CameraCaptureSession) {
-                        if (cameraDevice == null) return
+            val characteristics = cameraManager.getCameraCharacteristics(cameraDevice!!.id)
 
-                        captureSession = session
-                        try {
-                            captureSession?.setRepeatingRequest(
-                                previewRequestBuilder.build(),
-                                null,
-                                null
-                            )
-                        } catch (e: CameraAccessException) {
-                            Log.e("CameraAppp", "Failed to start camera preview", e)
-                        }
-                    }
+            // Set Auto Exposure Mode
+            characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES)?.let { aeModes ->
+                if (aeModes.contains(CameraMetadata.CONTROL_AE_MODE_ON)) {
+                    previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                }
+            }
 
-                    override fun onConfigureFailed(session: CameraCaptureSession) {
-                        Log.e("CameraAppp", "Failed to configure camera session")
-                        Toast.makeText(this@MainActivity, "Failed to configure camera", Toast.LENGTH_SHORT).show()
+            // Set Auto White Balance Mode
+            characteristics.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.let { awbModes ->
+                if (awbModes.contains(CameraMetadata.CONTROL_AWB_MODE_AUTO)) {
+                    previewRequestBuilder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+                }
+            }
+
+            // Set Focus Mode
+            previewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+
+            // Set Exposure Compensation
+            characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)?.let { range ->
+                previewRequestBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, range.upper / 2)
+            }
+
+            // Set ISO Sensitivity
+            characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { isoRange ->
+                previewRequestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, isoRange.upper / 2)
+            }
+
+            cameraDevice!!.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    if (cameraDevice == null) return
+                    captureSession = session
+                    try {
+                        captureSession?.setRepeatingRequest(previewRequestBuilder.build(), null, null)
+                    } catch (e: CameraAccessException) {
+                        Log.e("CameraApp", "Failed to start camera preview", e)
                     }
-                },
-                null
-            )
+                }
+
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    Toast.makeText(this@MainActivity, "Failed to configure camera", Toast.LENGTH_SHORT).show()
+                }
+            }, null)
         } catch (e: CameraAccessException) {
-            Log.e("CameraAppp", "Error starting camera preview", e)
+            Log.e("CameraApp", "Error starting camera preview", e)
         }
     }
 
@@ -371,43 +385,43 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun logCameraParameters() {
-        try {
-            cameraDevice?.let { device ->
-                val characteristics = cameraManager.getCameraCharacteristics(device.id)
-                Log.d("CameraApp", "COLOR_CORRECTION_ABERRATION_MODE: ${characteristics.get(CameraCharacteristics
-                    .COLOR_CORRECTION_AVAILABLE_ABERRATION_MODES)?.joinToString()}")
-                Log.d("CameraApp", "CONTROL_AE_AVAILABLE_MODES: ${characteristics.get(CameraCharacteristics
-                    .CONTROL_AE_AVAILABLE_MODES)?.joinToString()}")
-                Log.d("CameraApp", "CONTROL_AE_COMPENSATION_RANGE: ${characteristics.get(CameraCharacteristics
-                    .CONTROL_AE_COMPENSATION_RANGE)}")
-                Log.d("CameraApp", "CONTROL_AE_COMPENSATION_STEP: ${characteristics.get(CameraCharacteristics
-                    .CONTROL_AE_COMPENSATION_STEP)}")
-                Log.d("CameraApp", "CONTROL_AE_LOCK_AVAILABLE: ${characteristics.get(CameraCharacteristics
-                    .CONTROL_AE_LOCK_AVAILABLE)}")
-                Log.d("CameraApp", "CONTROL_AWB_AVAILABLE_MODES: ${characteristics.get(CameraCharacteristics
-                    .CONTROL_AWB_AVAILABLE_MODES)?.joinToString()}")
-                Log.d("CameraApp", "LENS_INFO_AVAILABLE_FOCAL_LENGTHS: ${characteristics.get(CameraCharacteristics
-                    .LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.joinToString()}")
-                Log.d("CameraApp", "LENS_INFO_HYPERFOCAL_DISTANCE: ${characteristics.get(CameraCharacteristics
-                    .LENS_INFO_HYPERFOCAL_DISTANCE)}")
-                Log.d("CameraApp", "SENSOR_INFO_SENSITIVITY_RANGE: ${characteristics.get(CameraCharacteristics
-                    .SENSOR_INFO_SENSITIVITY_RANGE)}")
-                Log.d("CameraApp", "SENSOR_INFO_EXPOSURE_TIME_RANGE: ${characteristics.get(CameraCharacteristics
-                    .SENSOR_INFO_EXPOSURE_TIME_RANGE)}")
-                Log.d("CameraApp", "SENSOR_ORIENTATION: ${characteristics.get(CameraCharacteristics
-                    .SENSOR_ORIENTATION)}")
-                Log.d("CameraApp", "SENSOR_INFO_PIXEL_ARRAY_SIZE: ${characteristics.get(CameraCharacteristics
-                    .SENSOR_INFO_PIXEL_ARRAY_SIZE)}")
-                Log.d("CameraApp", "SENSOR_INFO_PHYSICAL_SIZE: ${characteristics.get(CameraCharacteristics
-                    .SENSOR_INFO_PHYSICAL_SIZE)}")
-                Log.d("CameraApp", "SCALER_AVAILABLE_STREAM_CONFIGURATIONS: ${characteristics.get(CameraCharacteristics
-                    .SCALER_STREAM_CONFIGURATION_MAP)}")
-            }
-        } catch (e: CameraAccessException) {
-            Log.e("CameraApp", "Error retrieving camera parameters", e)
-        }
-    }
+//    private fun logCameraParameters() {
+//        try {
+//            cameraDevice?.let { device ->
+//                val characteristics = cameraManager.getCameraCharacteristics(device.id)
+//                Log.d("CameraApp", "COLOR_CORRECTION_ABERRATION_MODE: ${characteristics.get(CameraCharacteristics
+//                    .COLOR_CORRECTION_AVAILABLE_ABERRATION_MODES)?.joinToString()}")
+//                Log.d("CameraApp", "CONTROL_AE_AVAILABLE_MODES: ${characteristics.get(CameraCharacteristics
+//                    .CONTROL_AE_AVAILABLE_MODES)?.joinToString()}")
+//                Log.d("CameraApp", "CONTROL_AE_COMPENSATION_RANGE: ${characteristics.get(CameraCharacteristics
+//                    .CONTROL_AE_COMPENSATION_RANGE)}")
+//                Log.d("CameraApp", "CONTROL_AE_COMPENSATION_STEP: ${characteristics.get(CameraCharacteristics
+//                    .CONTROL_AE_COMPENSATION_STEP)}")
+//                Log.d("CameraApp", "CONTROL_AE_LOCK_AVAILABLE: ${characteristics.get(CameraCharacteristics
+//                    .CONTROL_AE_LOCK_AVAILABLE)}")
+//                Log.d("CameraApp", "CONTROL_AWB_AVAILABLE_MODES: ${characteristics.get(CameraCharacteristics
+//                    .CONTROL_AWB_AVAILABLE_MODES)?.joinToString()}")
+//                Log.d("CameraApp", "LENS_INFO_AVAILABLE_FOCAL_LENGTHS: ${characteristics.get(CameraCharacteristics
+//                    .LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.joinToString()}")
+//                Log.d("CameraApp", "LENS_INFO_HYPERFOCAL_DISTANCE: ${characteristics.get(CameraCharacteristics
+//                    .LENS_INFO_HYPERFOCAL_DISTANCE)}")
+//                Log.d("CameraApp", "SENSOR_INFO_SENSITIVITY_RANGE: ${characteristics.get(CameraCharacteristics
+//                    .SENSOR_INFO_SENSITIVITY_RANGE)}")
+//                Log.d("CameraApp", "SENSOR_INFO_EXPOSURE_TIME_RANGE: ${characteristics.get(CameraCharacteristics
+//                    .SENSOR_INFO_EXPOSURE_TIME_RANGE)}")
+//                Log.d("CameraApp", "SENSOR_ORIENTATION: ${characteristics.get(CameraCharacteristics
+//                    .SENSOR_ORIENTATION)}")
+//                Log.d("CameraApp", "SENSOR_INFO_PIXEL_ARRAY_SIZE: ${characteristics.get(CameraCharacteristics
+//                    .SENSOR_INFO_PIXEL_ARRAY_SIZE)}")
+//                Log.d("CameraApp", "SENSOR_INFO_PHYSICAL_SIZE: ${characteristics.get(CameraCharacteristics
+//                    .SENSOR_INFO_PHYSICAL_SIZE)}")
+//                Log.d("CameraApp", "SCALER_AVAILABLE_STREAM_CONFIGURATIONS: ${characteristics.get(CameraCharacteristics
+//                    .SCALER_STREAM_CONFIGURATION_MAP)}")
+//            }
+//        } catch (e: CameraAccessException) {
+//            Log.e("CameraApp", "Error retrieving camera parameters", e)
+//        }
+//    }
 
 
     override fun onPause() {
